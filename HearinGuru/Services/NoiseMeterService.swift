@@ -7,8 +7,9 @@ final class NoiseMeterService: ObservableObject {
     @Published var dbLevel: Float   = 30
     @Published var riskLevel: RiskLevel = .safe
 
-    private var engine    = AVAudioEngine()
-    private var isRunning = false
+    private var engine       = AVAudioEngine()
+    private var isRunning    = false
+    private var tapInstalled = false
 
     enum RiskLevel: String {
         case safe     = "Safe"
@@ -27,10 +28,10 @@ final class NoiseMeterService: ObservableObject {
 
         static func from(db: Float) -> RiskLevel {
             switch db {
-            case ..<70:  return .safe
-            case 70..<85: return .moderate
-            case 85..<100: return .loud
-            default:     return .danger
+            case ..<70:       return .safe
+            case 70..<85:     return .moderate
+            case 85..<100:    return .loud
+            default:          return .danger
             }
         }
     }
@@ -40,53 +41,102 @@ final class NoiseMeterService: ObservableObject {
 
     func start() {
         guard !isRunning else { return }
-        do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.record)
-            try session.setActive(true)
 
-            engine = AVAudioEngine()
-            engine.prepare()
-            try engine.start()
-            installTap()
-            isRunning   = true
-            isMonitoring = true
-        } catch {
-            print("[NoiseMeterService] error: \(error)")
+        // Request microphone permission first
+        AVAudioApplication.requestRecordPermission { [weak self] granted in
+            guard let self else { return }
+            DispatchQueue.main.async {
+                if granted {
+                    self.startInternal()
+                } else {
+                    print("[NoiseMeterService] microphone permission denied")
+                }
+            }
         }
     }
 
     func stop() {
         guard isRunning else { return }
-        engine.inputNode.removeTap(onBus: 0)
+        removeTapSafely()
         engine.stop()
         isRunning    = false
+        tapInstalled = false
         isMonitoring = false
+    }
+
+
+    // MARK: - Internal start
+
+    private func startInternal() {
+        do {
+            let session = AVAudioSession.sharedInstance()
+            // Use .playAndRecord + .mixWithOthers so noise meter doesn't kill tinnitus playback
+            try session.setCategory(
+                .playAndRecord,
+                mode: .measurement,
+                options: [.mixWithOthers, .defaultToSpeaker]
+            )
+            try session.setActive(true)
+
+            engine = AVAudioEngine()
+            let inputFormat = engine.inputNode.inputFormat(forBus: 0)
+
+            guard inputFormat.sampleRate > 0 else {
+                print("[NoiseMeterService] invalid input format — mic unavailable")
+                return
+            }
+
+            engine.prepare()
+            try engine.start()
+            installTap()
+            isRunning    = true
+            isMonitoring = true
+        } catch {
+            print("[NoiseMeterService] error: \(error)")
+            tearDown()
+        }
     }
 
 
     // MARK: - Tap
 
     private func installTap() {
+        guard !tapInstalled else { return }
         let input  = engine.inputNode
-        let format = input.outputFormat(forBus: 0)
+        let format = input.inputFormat(forBus: 0)
 
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             guard let self else { return }
-            let channelData = buffer.floatChannelData?[0]
+            guard let channelData = buffer.floatChannelData?[0] else { return }
             let frameLength = Int(buffer.frameLength)
-            guard let data = channelData, frameLength > 0 else { return }
+            guard frameLength > 0 else { return }
 
             var sum: Float = 0
-            for i in 0..<frameLength { sum += data[i] * data[i] }
+            for i in 0..<frameLength { sum += channelData[i] * channelData[i] }
             let rms = sqrt(sum / Float(frameLength))
-            let db  = rms > 0 ? 20 * log10(rms) + 94 : 30  // SPL offset approx
+            // +94 dB offset approximates FS dBFS → dB SPL conversion
+            let db  = rms > 0 ? 20 * log10(rms) + 94 : 30
 
             DispatchQueue.main.async {
-                let clampedDb = max(30, min(120, db))
-                self.dbLevel    = clampedDb
-                self.riskLevel  = RiskLevel.from(db: clampedDb)
+                let clamped = max(30, min(120, db))
+                self.dbLevel   = clamped
+                self.riskLevel = RiskLevel.from(db: clamped)
             }
         }
+        tapInstalled = true
+    }
+
+    private func removeTapSafely() {
+        guard tapInstalled else { return }
+        engine.inputNode.removeTap(onBus: 0)
+        tapInstalled = false
+    }
+
+    private func tearDown() {
+        if engine.isRunning { engine.stop() }
+        tapInstalled = false
+        isRunning    = false
+        isMonitoring = false
+        engine       = AVAudioEngine()
     }
 }
